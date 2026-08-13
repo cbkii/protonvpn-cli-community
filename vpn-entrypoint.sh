@@ -130,9 +130,10 @@ watchdog_loop() {
     done
 }
 
-# Initialize ProtonVPN
+# Initialize ProtonVPN. The Python entrypoint consumes configured environment
+# ingress internally; no secret values or user-supplied tier are placed in argv.
 echo "Initializing ProtonVPN..."
-protonvpn init --username $PROTONVPN_USERNAME --password $PROTONVPN_PASSWORD --tier $PROTONVPN_TIER --protocol $PROTONVPN_PROTOCOL --openvpn-username "$OPENVPN_USERNAME" --openvpn-password "$OPENVPN_PASSWORD" --force
+protonvpn init --protocol "${PROTONVPN_PROTOCOL:-udp}" --force
 
 # Check if serverinfo.json was created
 if [ ! -f ~/.pvpn-cli/serverinfo.json ]; then
@@ -145,16 +146,6 @@ if [ ! -f ~/.pvpn-cli/serverinfo.json ]; then
     fi
     exit 1
 fi
-
-# # Verify that the passfile was created with the OpenVPN credentials
-# echo "Verifying passfile..."
-# if [ -f ~/.pvpn-cli/pvpnpass ]; then
-#     echo "Passfile created successfully."
-#     # Display the first line of the passfile (username) to verify it's using the OpenVPN credentials
-#     head -n 1 ~/.pvpn-cli/pvpnpass
-# else
-#     echo "Error: Passfile not created."
-# fi
 
 # Attempt to connect with retries
 if ! connect_vpn_with_retry; then
