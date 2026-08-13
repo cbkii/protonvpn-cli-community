@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 import pytest
 
-from protonvpn_cli.account import AccountRequired, AccountService
+from protonvpn_cli.account import (
+    AccountOperationTimeout,
+    AccountRequired,
+    AccountService,
+)
 from protonvpn_cli.constants import VERSION
 
 
@@ -49,9 +53,25 @@ def test_existing_session_supplies_account_metadata_without_new_login():
     assert api.login_calls == []
 
 
+def test_unexpected_numeric_account_values_do_not_crash_info():
+    api = FakeAPI(active=True)
+    api.user_tier = None
+    api.account_data.max_connections = "unknown"
+    info = AccountService(api=api).info()
+    assert info.tier is None
+    assert info.max_connections is None
+
+
 def test_account_metadata_requires_active_session():
     with pytest.raises(AccountRequired):
         AccountService(api=FakeAPI()).info()
+
+
+def test_service_rejects_non_positive_timeout():
+    with pytest.raises(ValueError):
+        AccountService(api=FakeAPI(), timeout=0)
+    with pytest.raises(ValueError):
+        AccountService(api=FakeAPI(), timeout=-1)
 
 
 def test_server_refresh_reuses_current_session():
@@ -60,6 +80,17 @@ def test_server_refresh_reuses_current_session():
     assert result == ["server-a"]
     assert api.refresher.calls == 1
     assert api.login_calls == []
+
+
+def test_server_refresh_timeout_is_mapped():
+    api = FakeAPI(active=True)
+
+    async def slow_refresh():
+        await asyncio.sleep(1)
+
+    api.refresher.get_up_to_date_server_list = slow_refresh
+    with pytest.raises(AccountOperationTimeout):
+        asyncio.run(AccountService(api=api, timeout=0.001).server_list())
 
 
 def test_sign_out_is_idempotent():
@@ -71,6 +102,17 @@ def test_sign_out_is_idempotent():
     asyncio.run(AccountService(api=active).sign_out())
     assert active.logout_calls == 1
     assert not active.is_user_logged_in()
+
+
+def test_sign_out_timeout_is_mapped():
+    api = FakeAPI(active=True)
+
+    async def slow_logout():
+        await asyncio.sleep(1)
+
+    api.logout = slow_logout
+    with pytest.raises(AccountOperationTimeout):
+        asyncio.run(AccountService(api=api, timeout=0.001).sign_out())
 
 
 def test_default_api_uses_project_version_metadata():

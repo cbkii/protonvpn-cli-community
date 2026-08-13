@@ -45,9 +45,16 @@ class AccountInfo:
     name: Optional[str]
     plan_name: Optional[str]
     plan_title: Optional[str]
-    tier: int
+    tier: Optional[int]
     max_connections: Optional[int]
     delinquent: Optional[bool]
+
+
+def _optional_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class AccountService:
@@ -76,8 +83,10 @@ class AccountService:
             name=self._api.account_name,
             plan_name=getattr(account, "plan_name", None),
             plan_title=getattr(account, "plan_title", None),
-            tier=int(self._api.user_tier),
-            max_connections=getattr(account, "max_connections", None),
+            tier=_optional_int(self._api.user_tier),
+            max_connections=_optional_int(
+                getattr(account, "max_connections", None)
+            ),
             delinquent=getattr(account, "delinquent", None),
         )
 
@@ -95,38 +104,49 @@ class AccountService:
         if max_totp_attempts < 1:
             raise ValueError("max_totp_attempts must be at least 1")
 
+        primary_value = get_primary_secret()
+        if not isinstance(primary_value, str) or not primary_value:
+            raise PrimaryAuthenticationFailed("Primary value is empty")
+
         try:
             result = await asyncio.wait_for(
-                self._api.login(username.strip(), get_primary_secret()),
+                self._api.login(username.strip(), primary_value),
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError as exc:
             raise AccountOperationTimeout("Proton sign-in timed out") from exc
 
         if not result.authenticated:
-            raise PrimaryAuthenticationFailed("Proton authentication failed")
+            raise PrimaryAuthenticationFailed("Primary flow failed")
 
         attempts = 0
         while result.twofa_required:
             if get_totp is None:
-                raise SecondFactorRequired("TOTP authentication is required")
+                raise SecondFactorRequired("A second factor is required")
             if attempts >= max_totp_attempts:
-                raise SecondFactorFailed("TOTP authentication failed")
+                raise SecondFactorFailed("Second-factor flow failed")
+
+            second_value = get_totp()
+            if not isinstance(second_value, str) or not second_value.strip():
+                raise SecondFactorFailed("Second-factor value is empty")
+
             attempts += 1
             try:
                 result = await asyncio.wait_for(
-                    self._api.submit_2fa_code(get_totp().strip()),
+                    self._api.submit_2fa_code(second_value.strip()),
                     timeout=self._timeout,
                 )
             except asyncio.TimeoutError as exc:
-                raise AccountOperationTimeout("TOTP authentication timed out") from exc
+                raise AccountOperationTimeout(
+                    "Second-factor flow timed out"
+                ) from exc
 
             if not result.authenticated and not result.twofa_required:
-                raise SecondFactorFailed("TOTP authentication failed")
+                raise SecondFactorFailed("Second-factor flow failed")
 
         if not self.active:
             raise AccountError(
-                "Proton reported successful authentication without an active session"
+                "Proton reported successful sign-in without an active session"
             )
         return self.info()
 
