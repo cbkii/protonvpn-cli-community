@@ -17,5 +17,7 @@ SERVER_INFO_FILE = os.path.join(CONFIG_DIR, "serverinfo.json")
 SPLIT_TUNNEL_FILE = os.path.join(CONFIG_DIR, "split_tunnel.txt")
 OVPN_FILE = os.path.join(CONFIG_DIR, "connect.ovpn")
 PASSFILE = os.path.join(CONFIG_DIR, "ovpnpass")
+SECRETS_DIR = os.path.join(CONFIG_DIR, "secrets")
+ACCOUNT_SECRETS_FILE = os.path.join(SECRETS_DIR, "account.json")
 CLIENT_SUFFIX = "f1"  # Block malware
 VERSION = "3.2.2"

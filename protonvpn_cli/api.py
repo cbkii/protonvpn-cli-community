@@ -12,9 +12,11 @@ app = FastAPI(title="ProtonVPN CLI API")
 class InitRequest(BaseModel):
     username: str
     password: str
-    tier: int
+    tier: Optional[int] = None
     protocol: Optional[str] = "udp"
     force: Optional[bool] = False
+    openvpn_username: Optional[str] = None
+    openvpn_password: Optional[str] = None
 
 
 class ConnectRequest(BaseModel):
@@ -30,10 +32,16 @@ class ConnectRequest(BaseModel):
     split_tunnel_type: Optional[str] = None
 
 
-def run_cli_command(command: List[str]) -> dict:
-    """Run a protonvpn-cli command and return the result"""
+def run_cli_command(command: List[str], env: Optional[dict] = None) -> dict:
+    """Run a protonvpn-cli command and return the result."""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
         return {"success": True, "output": result.stdout}
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"Command failed: {e.stderr}")
@@ -41,21 +49,33 @@ def run_cli_command(command: List[str]) -> dict:
 
 @app.post("/init")
 async def initialize(request: InitRequest):
-    """Initialize ProtonVPN with credentials"""
-    command = ["protonvpn", "init"]
+    """Initialize ProtonVPN without placing secret values in subprocess argv."""
+    openvpn_username = request.openvpn_username or os.environ.get("OPENVPN_USERNAME")
+    openvpn_password = request.openvpn_password or os.environ.get("OPENVPN_PASSWORD")
+    if not openvpn_username or not openvpn_password:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "OpenVPN credentials are required for initialization; provide "
+                "openvpn_username/openvpn_password or configure the container environment"
+            ),
+        )
 
-    if request.username:
-        command.extend(["--username", request.username])
-    if request.password:
-        command.extend(["--password", request.password])
-    if request.tier:
-        command.extend(["--tier", str(request.tier)])
+    command = ["protonvpn", "init"]
     if request.protocol:
         command.extend(["--protocol", request.protocol])
     if request.force:
         command.append("--force")
 
-    return run_cli_command(command)
+    env = os.environ.copy()
+    env["PROTONVPN_USERNAME"] = request.username
+    env["PROTONVPN_PASSWORD"] = request.password
+    env["OPENVPN_USERNAME"] = openvpn_username
+    env["OPENVPN_PASSWORD"] = openvpn_password
+
+    # request.tier remains accepted for API compatibility but is deliberately
+    # not forwarded; authenticated Proton account metadata is authoritative.
+    return run_cli_command(command, env=env)
 
 
 @app.post("/connect")
