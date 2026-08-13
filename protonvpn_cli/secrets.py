@@ -112,6 +112,16 @@ class AccountSecretStore:
         except OSError as exc:
             raise SecretStoreError("Unable to delete account secret store") from exc
 
+    def bootstrap_from_environment(self) -> bool:
+        if self.exists():
+            return False
+        username = os.environ.get("PROTONVPN_USERNAME", "").strip()
+        password = os.environ.get("PROTONVPN_PASSWORD", "")
+        if not username or not password:
+            return False
+        self.save(username, password)
+        return True
+
     def migrate_legacy_config(self, config_path: str = CONFIG_FILE) -> bool:
         """Move a legacy [USER] password entry into the dedicated secret store.
 
@@ -119,11 +129,13 @@ class AccountSecretStore:
         data takes precedence, but the plaintext config password is still removed.
         """
         if not os.path.isfile(config_path):
+            self.bootstrap_from_environment()
             return False
 
         config = configparser.ConfigParser()
         config.read(config_path)
         if not config.has_option("USER", "password"):
+            self.bootstrap_from_environment()
             return False
 
         password = config.get("USER", "password", fallback="")
