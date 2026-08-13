@@ -36,7 +36,7 @@ Non-secret compatibility values such as username, protocol settings and Proton-d
 
 `protonvpn init` remains while the current OpenVPN transport still needs its separate OpenVPN account pair.
 
-Normal host use rejects legacy `--password`, `--openvpn-password`, and `--tier` arguments. Use hidden prompts instead. Plan/tier is obtained from authenticated Proton account metadata rather than selected manually.
+Legacy `--password`, `--openvpn-password`, and `--tier` arguments are no longer part of the normal initialization path. Interactive use relies on hidden prompts; service/container automation uses supported environment ingress. Plan/tier is obtained from authenticated Proton account metadata rather than selected manually.
 
 OpenVPN credentials remain separate from the Proton account login and continue to use the restricted OpenVPN passfile required by the current transport backend.
 
@@ -54,11 +54,11 @@ OPENVPN_PASSWORD
 
 When no persistent account secret exists, a complete Proton account pair from the environment seeds the restricted account file before legacy initialisation. Values are not copied into `pvpn-cli.cfg`.
 
-The HTTP `/init` adapter also transfers bootstrap values to its child process through the environment rather than password-bearing CLI arguments. Its historical tier field remains accepted for compatibility but is ignored as an authority.
+The Docker bootstrap invokes `protonvpn init` with protocol/force controls only. Account credentials, OpenVPN credentials and plan tier are not copied into its command line.
 
-### Docker transition
+The HTTP `/init` adapter similarly transfers bootstrap values to its child process through the environment rather than password-bearing CLI arguments. Its historical tier field remains accepted for compatibility but is ignored as an authority.
 
-The existing `vpn-entrypoint.sh` still uses the historical all-arguments `init` form. Until that shell bootstrap is updated, the Python entrypoint contains a bounded Docker-only compatibility path. In that path, account credentials are intercepted into the dedicated secret store, known account/OpenVPN values are redacted from legacy log output, and authenticated Proton tier metadata overrides the legacy supplied tier. Normal host CLI use continues to reject those secret-bearing arguments.
+The Python dispatcher still recognises the historical all-argument form when invoked manually from an existing Docker environment as a short-term compatibility fallback, but the provided Docker bootstrap no longer uses it. Normal host CLI use rejects that form.
 
 ## Next phase
 
