@@ -50,7 +50,7 @@ Homepage = "https://github.com/cbkii/protonvpn-cli-community"
 Repository = "https://github.com/cbkii/protonvpn-cli-community"
 
 [project.scripts]
-protonvpn = "protonvpn_cli.cli:main"
+protonvpn = "protonvpn_cli.entrypoint:main"
 
 [tool.setuptools]
 packages = ["protonvpn_cli"]
