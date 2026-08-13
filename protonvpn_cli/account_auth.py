@@ -14,13 +14,25 @@ class AccountCommandError(RuntimeError):
 
 
 async def open_account(username=None, primary_value=None, interactive=False):
-    """Return an authenticated AccountService, reusing persisted credentials."""
+    """Return an authenticated AccountService, reusing persisted credentials.
+
+    Environment variables are accepted as a non-interactive ingress for
+    container/system service bootstrapping, but are never written to argv or
+    ordinary configuration. The validated primary value is persisted through
+    AccountSecretStore for later headless reuse.
+    """
     service = AccountService()
     if service.active:
         return service
 
     store = AccountSecretStore()
     stored = store.load()
+
+    if username is None:
+        username = os.environ.get("PROTONVPN_USERNAME")
+    if primary_value is None:
+        primary_value = os.environ.get("PROTONVPN_PASSWORD")
+
     if username is None and stored is not None:
         username = stored.username
     if primary_value is None and stored is not None and username == stored.username:
@@ -31,13 +43,17 @@ async def open_account(username=None, primary_value=None, interactive=False):
     if primary_value is None and interactive:
         primary_value = getpass.getpass("Enter your ProtonVPN password: ")
     if not username or not primary_value:
-        raise AccountCommandError("Stored or interactive Proton credentials are required")
+        raise AccountCommandError(
+            "Stored, environment, or interactive Proton credentials are required"
+        )
 
     def primary_secret():
         return primary_value
 
     def second_factor():
-        code = os.environ.get("PROTONVPN_2FA") or os.environ.get("PROTONVPN_2FA_CODE")
+        code = os.environ.get("PROTONVPN_2FA") or os.environ.get(
+            "PROTONVPN_2FA_CODE"
+        )
         if code:
             return code
         return getpass.getpass("2FA Token: ") if interactive else ""

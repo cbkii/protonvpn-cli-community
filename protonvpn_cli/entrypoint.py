@@ -17,6 +17,9 @@ from .constants import CLIENT_SUFFIX, CONFIG_DIR, PASSFILE, SERVER_INFO_FILE, VE
 from .secrets import AccountSecretStore, SecretStoreError
 
 
+_SESSION = {"service": None}
+
+
 class _RedactSecrets(logging.Filter):
     def __init__(self, values):
         super().__init__()
@@ -36,6 +39,26 @@ def _install_redaction(values):
     redactor = _RedactSecrets(values)
     for handler in legacy_cli.logger.handlers:
         handler.addFilter(redactor)
+
+
+def _headless_environment():
+    return bool(
+        os.environ.get("PROTONVPN_USERNAME")
+        and os.environ.get("PROTONVPN_PASSWORD")
+    )
+
+
+async def _open_service(username=None, primary_value=None, interactive=False):
+    service = _SESSION.get("service")
+    if service is not None and service.active:
+        return service
+    service = await open_account(
+        username=username,
+        primary_value=primary_value,
+        interactive=interactive,
+    )
+    _SESSION["service"] = service
+    return service
 
 
 def _sync_account(service):
@@ -83,7 +106,7 @@ def _write_server_catalogue(server_list):
 
 
 async def _refresh_session(interactive=False):
-    service = await open_account(interactive=interactive)
+    service = await _open_service(interactive=interactive)
     _sync_account(service)
     server_list = await service.server_list()
     _write_server_catalogue(server_list)
@@ -124,6 +147,12 @@ def _secure_hooks(store, redactions):
             store.save(username, str(value))
             redactions.append(str(value))
             return
+        if group == "USER" and key == "tier":
+            service = _SESSION.get("service")
+            if service is not None and service.active:
+                authoritative = service.info().tier
+                if authoritative is not None:
+                    value = authoritative
         return original_set(group, key, value)
 
     def truthful_metadata(*args, **kwargs):
@@ -131,44 +160,59 @@ def _secure_hooks(store, redactions):
         return original_metadata(*args, **kwargs)
 
     def safe_openvpn_credentials(write=True):
-        username = input("Enter your OpenVPN username: ").strip()
-        first = getpass.getpass("Enter your OpenVPN password: ")
-        second = getpass.getpass("Confirm your OpenVPN password: ")
-        if first != second:
-            raise SystemExit("OpenVPN passwords do not match")
-        if not username or not first:
+        username = os.environ.get("OPENVPN_USERNAME")
+        value = os.environ.get("OPENVPN_PASSWORD")
+        if not username:
+            username = input("Enter your OpenVPN username: ").strip()
+        if not value:
+            first = getpass.getpass("Enter your OpenVPN password: ")
+            second = getpass.getpass("Confirm your OpenVPN password: ")
+            if first != second:
+                raise SystemExit("OpenVPN passwords do not match")
+            value = first
+        if not username or not value:
             raise SystemExit("OpenVPN credentials are required")
-        redactions.append(first)
+        redactions.append(value)
         if write:
             os.makedirs(CONFIG_DIR, exist_ok=True)
             with open(PASSFILE, "w", encoding="utf-8") as handle:
                 handle.write(
-                    "{0}+{1}\n{2}".format(username, CLIENT_SUFFIX, first)
+                    "{0}+{1}\n{2}".format(username, CLIENT_SUFFIX, value)
                 )
             os.chmod(PASSFILE, 0o600)
             utils.change_file_owner(PASSFILE)
             print("OpenVPN credentials have been updated!")
-        return username, first
+        return username, value
 
     def safe_account_credentials():
-        username = input("Enter your ProtonVPN username: ").strip()
-        first = getpass.getpass("Enter your ProtonVPN password: ")
-        second = getpass.getpass("Confirm your ProtonVPN password: ")
-        if first != second:
-            raise SystemExit("ProtonVPN passwords do not match")
-        redactions.append(first)
+        username = os.environ.get("PROTONVPN_USERNAME")
+        primary_value = os.environ.get("PROTONVPN_PASSWORD")
+        interactive = not _headless_environment()
+        if not username and interactive:
+            username = input("Enter your ProtonVPN username: ").strip()
+        if not primary_value and interactive:
+            first = getpass.getpass("Enter your ProtonVPN password: ")
+            second = getpass.getpass("Confirm your ProtonVPN password: ")
+            if first != second:
+                raise SystemExit("ProtonVPN passwords do not match")
+            primary_value = first
+        if not username or not primary_value:
+            raise SystemExit("ProtonVPN account credentials are required")
+        redactions.append(primary_value)
         service = asyncio.run(
-            open_account(
+            _open_service(
                 username=username,
-                primary_value=first,
-                interactive=True,
+                primary_value=primary_value,
+                interactive=interactive,
             )
         )
         _sync_account(service)
-        return username, first
+        return username, primary_value
 
     def authoritative_tier(write=False):
-        service = asyncio.run(open_account(interactive=True))
+        service = asyncio.run(
+            _open_service(interactive=not _headless_environment())
+        )
         info = _sync_account(service)
         if info.tier is None:
             raise SystemExit("Proton did not return a valid account tier")
@@ -190,7 +234,7 @@ def _secure_hooks(store, redactions):
     legacy_cli.pull_server_data = _legacy_refresh
 
 
-def _signin(store, argv):
+def _signin(argv):
     parser = argparse.ArgumentParser(prog="protonvpn signin")
     parser.add_argument("username", nargs="?")
     parser.add_argument("--username", dest="username_option")
@@ -201,17 +245,21 @@ def _signin(store, argv):
     username = args.username_option or args.username
     if args.replace:
         asyncio.run(sign_out_account(forget=True))
-    service = asyncio.run(open_account(username=username, interactive=True))
+        _SESSION["service"] = None
+    service = asyncio.run(
+        _open_service(username=username, interactive=not _headless_environment())
+    )
     info = _sync_account(service)
     print("Signed in as {0}.".format(info.name or username or "unknown"))
     print("Account secret stored in ~/.pvpn-cli/secrets/account.json (0600).")
 
 
-def _signout(store, argv):
+def _signout(argv):
     parser = argparse.ArgumentParser(prog="protonvpn signout")
     parser.add_argument("--keep-secret", action="store_true")
     args = parser.parse_args(argv)
     asyncio.run(sign_out_account(forget=not args.keep_secret))
+    _SESSION["service"] = None
     utils.remove_config_value("USER", "password")
     if args.keep_secret:
         print("Signed out; persisted account secret retained.")
@@ -221,7 +269,9 @@ def _signout(store, argv):
 
 def _account(store, argv):
     parser = argparse.ArgumentParser(prog="protonvpn account")
-    parser.add_argument("action", nargs="?", choices=("info", "status"), default="info")
+    parser.add_argument(
+        "action", nargs="?", choices=("info", "status"), default="info"
+    )
     args = parser.parse_args(argv)
     saved = store.load()
     if args.action == "status":
@@ -229,7 +279,9 @@ def _account(store, argv):
         if saved:
             print("Account: {0}".format(saved.username))
         return
-    service = asyncio.run(open_account(interactive=True))
+    service = asyncio.run(
+        _open_service(interactive=not _headless_environment())
+    )
     info = _sync_account(service)
     print("Account: {0}".format(info.name or "unknown"))
     print("Plan: {0}".format(info.plan_title or info.plan_name or "unknown"))
@@ -242,7 +294,7 @@ def _account(store, argv):
 def _refresh(argv):
     if argv:
         raise SystemExit("usage: protonvpn refresh")
-    asyncio.run(_refresh_session(interactive=True))
+    asyncio.run(_refresh_session(interactive=not _headless_environment()))
     print("Server catalogue refreshed using the account session boundary.")
 
 
@@ -257,6 +309,10 @@ def main():
     redactions = []
     if saved is not None:
         redactions.append(saved.password)
+    for variable in ("PROTONVPN_PASSWORD", "OPENVPN_PASSWORD"):
+        value = os.environ.get(variable)
+        if value:
+            redactions.append(value)
     _install_redaction(redactions)
     _secure_hooks(store, redactions)
 
@@ -264,9 +320,9 @@ def main():
     command = argv[0] if argv else None
     try:
         if command == "signin":
-            return _signin(store, argv[1:])
+            return _signin(argv[1:])
         if command == "signout":
-            return _signout(store, argv[1:])
+            return _signout(argv[1:])
         if command == "account":
             return _account(store, argv[1:])
         if command == "refresh":
@@ -274,11 +330,12 @@ def main():
     except (AccountCommandError, SecretStoreError) as exc:
         raise SystemExit("Account operation failed: {0}".format(exc))
 
-    if command == "init" and any(
+    legacy_init_args = any(
         flag in argv for flag in ("--password", "--openvpn-password", "--tier")
-    ):
+    )
+    if command == "init" and legacy_init_args and not os.path.exists("/.dockerenv"):
         raise SystemExit(
             "Passwords and plan tier are no longer accepted on the command line; "
-            "run 'protonvpn init' and use the hidden prompts."
+            "run 'protonvpn init' and use prompts or supported environment ingress."
         )
     return legacy_cli.main()
