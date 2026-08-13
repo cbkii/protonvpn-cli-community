@@ -8,8 +8,11 @@ import sys
 
 from . import cli as legacy_cli
 from . import utils
-from .constants import CONFIG_DIR, PASSFILE
+from .constants import CONFIG_DIR, PASSFILE, VERSION
 from .secrets import AccountSecretStore, SecretStoreError
+
+
+_API_CAPTURE = {}
 
 
 class _RedactSecrets(logging.Filter):
@@ -33,9 +36,24 @@ def _install_redaction(values):
         handler.addFilter(redactor)
 
 
+def _sync_authoritative_tier():
+    api = _API_CAPTURE.get("api")
+    tier = getattr(api, "user_tier", None) if api is not None else None
+    if tier is None:
+        return None
+    try:
+        tier = int(tier)
+    except (TypeError, ValueError):
+        return None
+    utils.set_config_value("USER", "tier", tier)
+    return tier
+
+
 def _secure_hooks(store, redactions):
     original_get = utils.get_config_value
     original_set = utils.set_config_value
+    original_api = utils.ProtonVPNAPI
+    original_metadata = utils.ClientTypeMetadata
 
     def secure_get(group, key):
         if group == "USER" and key == "password":
@@ -58,6 +76,15 @@ def _secure_hooks(store, redactions):
             return
         return original_set(group, key, value)
 
+    def api_factory(*args, **kwargs):
+        api = original_api(*args, **kwargs)
+        _API_CAPTURE["api"] = api
+        return api
+
+    def truthful_metadata(*args, **kwargs):
+        kwargs["version"] = VERSION
+        return original_metadata(*args, **kwargs)
+
     def safe_openvpn_credentials(write=True):
         username = input("Enter your OpenVPN username: ").strip()
         first = getpass.getpass("Enter your OpenVPN password: ")
@@ -76,11 +103,25 @@ def _secure_hooks(store, redactions):
             print("OpenVPN credentials have been updated!")
         return username, first
 
+    def authoritative_tier(write=False):
+        if not utils.pull_server_data(force=True):
+            raise SystemExit("Unable to obtain account plan from Proton")
+        tier = _sync_authoritative_tier()
+        if tier is None:
+            raise SystemExit("Proton did not return a valid account tier")
+        print("ProtonVPN plan tier is reported by Proton: {0}".format(tier))
+        if write:
+            return tier
+        return tier + 1
+
     utils.get_config_value = secure_get
     legacy_cli.get_config_value = secure_get
     utils.set_config_value = secure_set
     legacy_cli.set_config_value = secure_set
+    utils.ProtonVPNAPI = api_factory
+    utils.ClientTypeMetadata = truthful_metadata
     legacy_cli.set_openvpn_credentials_config = safe_openvpn_credentials
+    legacy_cli.set_protonvpn_tier = authoritative_tier
 
 
 def _signin(store, redactions, argv):
@@ -102,6 +143,7 @@ def _signin(store, redactions, argv):
     if not utils.pull_server_data(force=True):
         store.delete()
         raise SystemExit("Sign-in validation failed; stored secret was removed")
+    _sync_authoritative_tier()
     print("Proton account credentials validated and stored securely.")
 
 
@@ -113,7 +155,7 @@ def _signout(store, argv):
         store.delete()
     utils.remove_config_value("USER", "password")
     if args.keep_secret:
-        print("Local account session cleared; persisted secret retained.")
+        print("Local account state cleared; persisted secret retained.")
     else:
         print("Persisted Proton account secret removed.")
 
@@ -137,6 +179,7 @@ def _refresh(argv):
         raise SystemExit("usage: protonvpn refresh")
     if not utils.pull_server_data(force=True):
         raise SystemExit("Server catalogue refresh failed")
+    _sync_authoritative_tier()
     print("Server catalogue refreshed using persisted account credentials.")
 
 
