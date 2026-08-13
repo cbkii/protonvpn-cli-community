@@ -1,18 +1,20 @@
-"""Public CLI compatibility layer for secure credential persistence."""
+"""Public CLI dispatcher for account/session migration."""
 
 import argparse
+import asyncio
 import getpass
+import json
 import logging
 import os
 import sys
+import tempfile
+import time
 
 from . import cli as legacy_cli
 from . import utils
-from .constants import CONFIG_DIR, PASSFILE, VERSION
+from .account_auth import AccountCommandError, open_account, sign_out_account
+from .constants import CLIENT_SUFFIX, CONFIG_DIR, PASSFILE, SERVER_INFO_FILE, VERSION
 from .secrets import AccountSecretStore, SecretStoreError
-
-
-_API_CAPTURE = {}
 
 
 class _RedactSecrets(logging.Filter):
@@ -36,23 +38,71 @@ def _install_redaction(values):
         handler.addFilter(redactor)
 
 
-def _sync_authoritative_tier():
-    api = _API_CAPTURE.get("api")
-    tier = getattr(api, "user_tier", None) if api is not None else None
-    if tier is None:
-        return None
+def _sync_account(service):
+    info = service.info()
+    if info.name:
+        utils.set_config_value("USER", "username", info.name)
+    if info.tier is not None:
+        utils.set_config_value("USER", "tier", info.tier)
+    utils.remove_config_value("USER", "password")
+    return info
+
+
+def _write_server_catalogue(server_list):
+    if hasattr(server_list, "to_dict"):
+        payload = server_list.to_dict()
+    elif isinstance(server_list, dict):
+        payload = server_list
+    elif isinstance(server_list, list):
+        payload = {"LogicalServers": server_list}
+    else:
+        raise AccountCommandError("Unsupported Proton server-list representation")
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=".serverinfo.", dir=CONFIG_DIR)
     try:
-        tier = int(tier)
-    except (TypeError, ValueError):
-        return None
-    utils.set_config_value("USER", "tier", tier)
-    return tier
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(path, SERVER_INFO_FILE)
+        path = ""
+        os.chmod(SERVER_INFO_FILE, 0o600)
+        utils.change_file_owner(SERVER_INFO_FILE)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+async def _refresh_session(interactive=False):
+    service = await open_account(interactive=interactive)
+    _sync_account(service)
+    server_list = await service.server_list()
+    _write_server_catalogue(server_list)
+    utils.set_config_value("metadata", "last_api_pull", int(time.time()))
+    return service
+
+
+def _legacy_refresh(force=False, username=None, password=None):
+    del force, username, password
+    try:
+        asyncio.run(_refresh_session(interactive=False))
+        return True
+    except (AccountCommandError, RuntimeError):
+        return False
 
 
 def _secure_hooks(store, redactions):
     original_get = utils.get_config_value
     original_set = utils.set_config_value
-    original_api = utils.ProtonVPNAPI
     original_metadata = utils.ClientTypeMetadata
 
     def secure_get(group, key):
@@ -76,11 +126,6 @@ def _secure_hooks(store, redactions):
             return
         return original_set(group, key, value)
 
-    def api_factory(*args, **kwargs):
-        api = original_api(*args, **kwargs)
-        _API_CAPTURE["api"] = api
-        return api
-
     def truthful_metadata(*args, **kwargs):
         kwargs["version"] = VERSION
         return original_metadata(*args, **kwargs)
@@ -97,101 +142,119 @@ def _secure_hooks(store, redactions):
         if write:
             os.makedirs(CONFIG_DIR, exist_ok=True)
             with open(PASSFILE, "w", encoding="utf-8") as handle:
-                handle.write("{0}+f1\n{1}".format(username, first))
+                handle.write(
+                    "{0}+{1}\n{2}".format(username, CLIENT_SUFFIX, first)
+                )
             os.chmod(PASSFILE, 0o600)
             utils.change_file_owner(PASSFILE)
             print("OpenVPN credentials have been updated!")
         return username, first
 
+    def safe_account_credentials():
+        username = input("Enter your ProtonVPN username: ").strip()
+        first = getpass.getpass("Enter your ProtonVPN password: ")
+        second = getpass.getpass("Confirm your ProtonVPN password: ")
+        if first != second:
+            raise SystemExit("ProtonVPN passwords do not match")
+        redactions.append(first)
+        service = asyncio.run(
+            open_account(
+                username=username,
+                primary_value=first,
+                interactive=True,
+            )
+        )
+        _sync_account(service)
+        return username, first
+
     def authoritative_tier(write=False):
-        if not utils.pull_server_data(force=True):
-            raise SystemExit("Unable to obtain account plan from Proton")
-        tier = _sync_authoritative_tier()
-        if tier is None:
+        service = asyncio.run(open_account(interactive=True))
+        info = _sync_account(service)
+        if info.tier is None:
             raise SystemExit("Proton did not return a valid account tier")
-        print("ProtonVPN plan tier is reported by Proton: {0}".format(tier))
+        title = info.plan_title or info.plan_name or "unknown"
+        print("ProtonVPN plan: {0} (tier {1})".format(title, info.tier))
         if write:
-            return tier
-        return tier + 1
+            return info.tier
+        return info.tier + 1
 
     utils.get_config_value = secure_get
     legacy_cli.get_config_value = secure_get
     utils.set_config_value = secure_set
     legacy_cli.set_config_value = secure_set
-    utils.ProtonVPNAPI = api_factory
     utils.ClientTypeMetadata = truthful_metadata
     legacy_cli.set_openvpn_credentials_config = safe_openvpn_credentials
+    legacy_cli.set_protonvpn_credentials_config = safe_account_credentials
     legacy_cli.set_protonvpn_tier = authoritative_tier
+    utils.pull_server_data = _legacy_refresh
+    legacy_cli.pull_server_data = _legacy_refresh
 
 
-def _signin(store, redactions, argv):
+def _signin(store, argv):
     parser = argparse.ArgumentParser(prog="protonvpn signin")
-    parser.add_argument("--username")
+    parser.add_argument("username", nargs="?")
+    parser.add_argument("--username", dest="username_option")
+    parser.add_argument("--replace", action="store_true")
     args = parser.parse_args(argv)
-    username = args.username or input("Enter your ProtonVPN username: ").strip()
-    first = getpass.getpass("Enter your ProtonVPN password: ")
-    second = getpass.getpass("Confirm your ProtonVPN password: ")
-    if first != second:
-        raise SystemExit("ProtonVPN passwords do not match")
-    if not username or not first:
-        raise SystemExit("ProtonVPN username and password are required")
-
-    store.save(username, first)
-    redactions.append(first)
-    utils.set_config_value("USER", "username", username)
-    utils.remove_config_value("USER", "password")
-    if not utils.pull_server_data(force=True):
-        store.delete()
-        raise SystemExit("Sign-in validation failed; stored secret was removed")
-    _sync_authoritative_tier()
-    print("Proton account credentials validated and stored securely.")
+    if args.username and args.username_option:
+        parser.error("specify USERNAME either positionally or with --username, not both")
+    username = args.username_option or args.username
+    if args.replace:
+        asyncio.run(sign_out_account(forget=True))
+    service = asyncio.run(open_account(username=username, interactive=True))
+    info = _sync_account(service)
+    print("Signed in as {0}.".format(info.name or username or "unknown"))
+    print("Account secret stored in ~/.pvpn-cli/secrets/account.json (0600).")
 
 
 def _signout(store, argv):
     parser = argparse.ArgumentParser(prog="protonvpn signout")
     parser.add_argument("--keep-secret", action="store_true")
     args = parser.parse_args(argv)
-    if not args.keep_secret:
-        store.delete()
+    asyncio.run(sign_out_account(forget=not args.keep_secret))
     utils.remove_config_value("USER", "password")
     if args.keep_secret:
-        print("Local account state cleared; persisted secret retained.")
+        print("Signed out; persisted account secret retained.")
     else:
-        print("Persisted Proton account secret removed.")
+        print("Signed out; persisted account secret removed.")
 
 
 def _account(store, argv):
-    if argv not in ([], ["info"]):
-        raise SystemExit("usage: protonvpn account [info]")
+    parser = argparse.ArgumentParser(prog="protonvpn account")
+    parser.add_argument("action", nargs="?", choices=("info", "status"), default="info")
+    args = parser.parse_args(argv)
     saved = store.load()
-    if saved is None:
-        raise SystemExit("No persisted Proton account secret. Run 'protonvpn signin'.")
-    print("Account: {0}".format(saved.username))
-    try:
-        print("Tier: {0}".format(utils.get_config_value("USER", "tier")))
-    except KeyError:
-        print("Tier: unknown")
-    print("Secret store: ~/.pvpn-cli/secrets/account.json")
+    if args.action == "status":
+        print("Persisted account secret: {0}".format("yes" if saved else "no"))
+        if saved:
+            print("Account: {0}".format(saved.username))
+        return
+    service = asyncio.run(open_account(interactive=True))
+    info = _sync_account(service)
+    print("Account: {0}".format(info.name or "unknown"))
+    print("Plan: {0}".format(info.plan_title or info.plan_name or "unknown"))
+    if info.tier is not None:
+        print("Tier: {0}".format(info.tier))
+    if info.max_connections is not None:
+        print("Maximum connections: {0}".format(info.max_connections))
 
 
 def _refresh(argv):
     if argv:
         raise SystemExit("usage: protonvpn refresh")
-    if not utils.pull_server_data(force=True):
-        raise SystemExit("Server catalogue refresh failed")
-    _sync_authoritative_tier()
-    print("Server catalogue refreshed using persisted account credentials.")
+    asyncio.run(_refresh_session(interactive=True))
+    print("Server catalogue refreshed using the account session boundary.")
 
 
 def main():
     store = AccountSecretStore()
     try:
         store.migrate_legacy_config()
+        saved = store.load()
     except (SecretStoreError, ValueError) as exc:
-        raise SystemExit("Unable to migrate legacy account secret: {0}".format(exc))
+        raise SystemExit("Unable to load account secret store: {0}".format(exc))
 
     redactions = []
-    saved = store.load()
     if saved is not None:
         redactions.append(saved.password)
     _install_redaction(redactions)
@@ -199,14 +262,18 @@ def main():
 
     argv = sys.argv[1:]
     command = argv[0] if argv else None
-    if command == "signin":
-        return _signin(store, redactions, argv[1:])
-    if command == "signout":
-        return _signout(store, argv[1:])
-    if command == "account":
-        return _account(store, argv[1:])
-    if command == "refresh":
-        return _refresh(argv[1:])
+    try:
+        if command == "signin":
+            return _signin(store, argv[1:])
+        if command == "signout":
+            return _signout(store, argv[1:])
+        if command == "account":
+            return _account(store, argv[1:])
+        if command == "refresh":
+            return _refresh(argv[1:])
+    except (AccountCommandError, SecretStoreError) as exc:
+        raise SystemExit("Account operation failed: {0}".format(exc))
+
     if command == "init" and any(
         flag in argv for flag in ("--password", "--openvpn-password", "--tier")
     ):
