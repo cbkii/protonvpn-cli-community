@@ -40,7 +40,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9"]
+test = [
+    "pytest>=8,<9",
+    "flake8>=7,<8",
+]
 
 [project.urls]
 Homepage = "https://github.com/cbkii/protonvpn-cli-community"
