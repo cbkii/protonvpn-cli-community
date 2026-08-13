@@ -3,9 +3,6 @@ name: Python Quality
 on:
   pull_request:
   push:
-    branches:
-      - master
-      - "agent/**"
 
 jobs:
   test:
@@ -27,6 +24,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[test]'
       - name: Lint
-        run: flake8 protonvpn_cli tests --count --show-source --statistics
+        run: flake8 . --count --show-source --statistics
       - name: Unit tests
         run: python -m pytest -q
